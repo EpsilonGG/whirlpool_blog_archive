@@ -1,0 +1,45 @@
+name: Download Blog Images
+
+on:
+  workflow_dispatch:
+
+
+jobs:
+
+  download:
+
+    runs-on: ubuntu-latest
+
+
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+
+    - name: Install
+      run: |
+        pip install -r requirements.txt
+
+
+    - name: Download images
+      run: |
+        python image_downloader.py
+
+
+    - name: Commit images
+      run: |
+        git config user.name github-actions
+        git config user.email github-actions@github.com
+
+        git add .
+
+        git commit -m "download blog images" || echo "no changes"
+
+        git push
