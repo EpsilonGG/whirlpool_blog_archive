@@ -9,9 +9,13 @@ from tqdm import tqdm
 from urllib.parse import urljoin, urlparse
 
 
-JSON_FILE = "output/articles.json"
+# ==========================
+# GitHub环境配置
+# ==========================
 
-IMAGE_DIR = "output/images"
+JSON_FILE = "articles.json"
+
+IMAGE_DIR = "images"
 
 BASE_URL = "http://blog.livedoor.jp/wp_staffblog/"
 
@@ -25,9 +29,9 @@ HEADERS = {
 
 
 
-# =========================
-# 日期
-# =========================
+# ==========================
+# 日期转换
+# ==========================
 
 def format_date(date):
 
@@ -50,72 +54,31 @@ def format_date(date):
 
 
 
-# =========================
+# ==========================
 # 下载图片
-# =========================
+# ==========================
 
 def download_image(
-        img_url,
+        url,
         filename
 ):
-
-
-    # livedoor 特殊处理
-
-    if "livedoor.blogimg.jp" in img_url:
-
-        img_url = img_url.replace(
-            "https://",
-            "http://"
-        )
-
 
     try:
 
 
-        # 第一请求
         r = requests.get(
-            img_url,
+            url,
             headers=HEADERS,
-            timeout=20,
-            allow_redirects=False
+            timeout=30
         )
-
-
-        # 如果301，禁止跳HTTPS
-        if r.status_code in [
-            301,
-            302,
-            303,
-            307,
-            308
-        ]:
-
-
-            print(
-                "跳转:",
-                r.headers.get(
-                    "location"
-                )
-            )
-
-
-            # 再尝试原地址
-            r = requests.get(
-                img_url,
-                headers=HEADERS,
-                timeout=20,
-                allow_redirects=False
-            )
-
 
 
         if r.status_code != 200:
 
             print(
-                "状态:",
+                "图片状态错误:",
                 r.status_code,
-                img_url
+                url
             )
 
             return None
@@ -123,7 +86,7 @@ def download_image(
 
 
         ext = os.path.splitext(
-            urlparse(img_url).path
+            urlparse(url).path
         )[1]
 
 
@@ -139,7 +102,7 @@ def download_image(
 
 
 
-        save_path=os.path.join(
+        path=os.path.join(
             IMAGE_DIR,
             filename+ext
         )
@@ -147,7 +110,7 @@ def download_image(
 
 
         with open(
-            save_path,
+            path,
             "wb"
         ) as f:
 
@@ -164,8 +127,8 @@ def download_image(
 
 
         print(
-            "下载异常:",
-            img_url,
+            "图片下载失败:",
+            url,
             e
         )
 
@@ -176,14 +139,22 @@ def download_image(
 
 
 
-# =========================
+# ==========================
 # 单文章处理
-# =========================
+# ==========================
 
 def process_article(article):
 
 
-    url=article["url"]
+    url=article.get(
+        "url"
+    )
+
+
+    if not url:
+
+        return article
+
 
 
     try:
@@ -191,7 +162,7 @@ def process_article(article):
         r=requests.get(
             url,
             headers=HEADERS,
-            timeout=20
+            timeout=30
         )
 
         r.encoding="utf-8"
@@ -205,8 +176,10 @@ def process_article(article):
 
     except Exception as e:
 
+
         print(
-            "文章失败",
+            "文章访问失败:",
+            url,
             e
         )
 
@@ -214,11 +187,12 @@ def process_article(article):
 
 
 
-    # title
+    # 修复标题
 
     title=soup.select_one(
         "h3.entry-title a"
     )
+
 
     if title:
 
@@ -247,14 +221,17 @@ def process_article(article):
     )
 
 
-    image_list=[]
+
+    images=[]
 
 
-    count=1
+    index=1
 
 
 
-    for img in main.find_all("img"):
+    for img in main.find_all(
+        "img"
+    ):
 
 
         src = (
@@ -279,7 +256,7 @@ def process_article(article):
 
 
 
-        filename=f"{date_key}-{count:02d}"
+        filename=f"{date_key}-{index:02d}"
 
 
 
@@ -293,25 +270,25 @@ def process_article(article):
         if saved:
 
 
-            image_list.append(
+            images.append(
                 {
-                    "file":saved,
-                    "url":img_url
+                    "file": saved,
+                    "url": img_url
                 }
             )
 
 
-            count+=1
+            index += 1
 
 
 
         time.sleep(
-            0.3
+            0.5
         )
 
 
 
-    article["images"]=image_list
+    article["images"]=images
 
 
     return article
@@ -320,9 +297,9 @@ def process_article(article):
 
 
 
-# =========================
-# MAIN
-# =========================
+# ==========================
+# 主程序
+# ==========================
 
 def main():
 
@@ -333,8 +310,19 @@ def main():
     )
 
 
+    if not os.path.exists(
+        JSON_FILE
+    ):
+
+        raise FileNotFoundError(
+            f"找不到 {JSON_FILE}，请确认上传到仓库根目录"
+        )
+
+
+
     with open(
         JSON_FILE,
+        "r",
         encoding="utf-8"
     ) as f:
 
@@ -343,14 +331,14 @@ def main():
 
 
     print(
-        "数量:",
+        "文章数量:",
         len(articles)
     )
 
 
 
     for article in tqdm(
-        articles[:5]
+        articles
     ):
 
 
@@ -380,8 +368,9 @@ def main():
         )
 
 
+
     print(
-        "完成"
+        "全部完成"
     )
 
 
