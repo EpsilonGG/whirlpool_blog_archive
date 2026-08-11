@@ -46,7 +46,7 @@ jobs:
 
       - name: Run crawler
         run: |
-          python crawler.py
+          python add_articles.py
 
       # ------------------------------------------------------
       # Commit results
