@@ -1,48 +1,111 @@
-name: Download Blog Images
 
-permissions:
-  contents: write
-  
+name: Download Whirlpool Exblog Archive
+
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
 
 jobs:
-
   download:
-
     runs-on: ubuntu-latest
 
-
     steps:
+      # ==========================================
+      # 1. 拉取仓库
+      # ==========================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Checkout
-      uses: actions/checkout@v4
+      # ==========================================
+      # 2. 设置 Python
+      # ==========================================
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
+      # ==========================================
+      # 3. 安装依赖
+      # ==========================================
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 tqdm
 
-    - name: Setup Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.12"
+      # ==========================================
+      # 4. 运行爬虫
+      # ==========================================
+      - name: Run crawler
+        run: |
+          python crawler.py
 
+      # ==========================================
+      # 5. 查看生成结果
+      # ==========================================
+      - name: Show output
+        run: |
+          echo "======================================"
+          echo "Generated files"
+          echo "======================================"
 
-    - name: Install
-      run: |
-        pip install -r requirements.txt
+          echo ""
+          echo "Root:"
+          ls -lh
 
+          echo ""
+          echo "Images:"
+          if [ -d "images" ]; then
+            find images -type f | head -30
+            echo ""
+            echo "Image count:"
+            find images -type f | wc -l
+          else
+            echo "No images directory"
+          fi
 
-    - name: Download images
-      run: |
-        python image_downloader.py
+          echo ""
+          echo "Article URLs:"
+          if [ -f "article_urls.json" ]; then
+            python - <<'PY'
+          import json
 
+          with open("article_urls.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
 
-    - name: Commit images
-      run: |
-        git config user.name github-actions
-        git config user.email github-actions@github.com
+          print("Article URL count:", len(data))
+          PY
+          fi
 
-        git add .
+          echo ""
+          echo "Articles:"
+          if [ -f "articles.json" ]; then
+            python - <<'PY'
+          import json
 
-        git commit -m "download blog images" || echo "no changes"
+          with open("articles.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
 
-        git push
+          print("Article count:", len(data))
+          PY
+          fi
+
+      # ==========================================
+      # 6. 提交结果回 GitHub
+      # ==========================================
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add articles.json
+          git add article_urls.json
+          git add images/
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update Whirlpool blog archive"
+            git push
+          fi
