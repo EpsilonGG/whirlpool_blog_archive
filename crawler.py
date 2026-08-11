@@ -13,6 +13,10 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+EXTRA_ARTICLE_URLS = [
+    "https://whirlpool.co.jp/release/blog/20251120/",
+    "https://whirlpool.co.jp/release/blog/watch-and-download-movie-glass-2019/",
+]
 
 # ============================================================
 # Configuration
@@ -968,7 +972,138 @@ def save_articles(
 # ============================================================
 # Main
 # ============================================================
+def add_extra_articles() -> None:
+    """
+    只抓取 EXTRA_ARTICLE_URLS 中指定的文章。
 
+    不扫描目录页。
+    不重新抓取已有文章。
+    不删除任何已有数据。
+    """
+
+    logger.info("=" * 70)
+    logger.info("补充指定 Whirlpool Blog 文章")
+    logger.info("=" * 70)
+
+    articles = load_articles()
+
+    existing_urls = {
+        normalize_url(article.get("url", ""))
+        for article in articles
+        if article.get("url")
+    }
+
+    added = 0
+    skipped = 0
+    failed = 0
+
+    for url in EXTRA_ARTICLE_URLS:
+
+        url = normalize_url(url)
+
+        logger.info("")
+        logger.info("处理：%s", url)
+
+        # ----------------------------------------------------
+        # 已经存在
+        # ----------------------------------------------------
+
+        if url in existing_urls:
+
+            logger.info(
+                "已经存在，跳过：%s",
+                url,
+            )
+
+            skipped += 1
+            continue
+
+        # ----------------------------------------------------
+        # 抓取
+        # ----------------------------------------------------
+
+        try:
+
+            article = crawl_article(url)
+
+            if article is None:
+
+                logger.warning(
+                    "页面不是有效 Blog 文章：%s",
+                    url,
+                )
+
+                failed += 1
+                continue
+
+            articles.append(article)
+
+            existing_urls.add(url)
+
+            added += 1
+
+            logger.info(
+                "成功添加：%s",
+                article.get("title", ""),
+            )
+
+        except Exception as exc:
+
+            failed += 1
+
+            logger.exception(
+                "添加失败：%s",
+                url,
+            )
+
+    # --------------------------------------------------------
+    # 只有真的新增文章时才保存
+    # --------------------------------------------------------
+
+    if added > 0:
+
+        save_articles(
+            articles
+        )
+
+        logger.info(
+            "已保存 articles.json"
+        )
+
+    else:
+
+        logger.info(
+            "没有新增文章，不修改 articles.json"
+        )
+
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("补充完成")
+    logger.info("=" * 70)
+
+    logger.info(
+        "新增：%d",
+        added,
+    )
+
+    logger.info(
+        "已存在：%d",
+        skipped,
+    )
+
+    logger.info(
+        "失败：%d",
+        failed,
+    )
+
+    logger.info(
+        "当前文章总数：%d",
+        len(articles),
+    )
+
+    logger.info(
+        "=" * 70
+    )
 def main():
 
     logger.info(
@@ -1182,4 +1317,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+
+    import sys
+
+    if "--add-missing" in sys.argv:
+        add_extra_articles()
+    else:
+        main()
