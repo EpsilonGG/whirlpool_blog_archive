@@ -1,3 +1,90 @@
-- name: Download images
-  run: |
-    python image_downloader.py
+name: Download Blog Images
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  download-images:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 获取仓库当前文件
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. 安装 Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 3. 安装依赖
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests tqdm
+
+      # 4. 下载图片
+      - name: Download images
+        run: |
+          python image_downloader.py
+
+      # 5. 查看结果
+      - name: Show results
+        run: |
+          echo "======================================"
+          echo "Download result"
+          echo "======================================"
+
+          echo ""
+          echo "Images:"
+          if [ -d "images" ]; then
+            find images -type f | sort
+            echo ""
+            echo "Image count:"
+            find images -type f | wc -l
+          else
+            echo "images directory does not exist"
+          fi
+
+          echo ""
+          echo "Articles:"
+          python - <<'PY'
+          import json
+
+          with open("articles.json", "r", encoding="utf-8") as f:
+              articles = json.load(f)
+
+          total = 0
+          downloaded = 0
+
+          for article in articles:
+              for image in article.get("images", []):
+                  total += 1
+
+                  if image.get("file"):
+                      downloaded += 1
+
+          print("Articles:", len(articles))
+          print("Image records:", total)
+          print("Downloaded:", downloaded)
+          PY
+
+      # 6. 提交下载结果
+      - name: Commit downloaded images
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add articles.json
+          git add images/
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Download blog images"
+            git push
+          fi
