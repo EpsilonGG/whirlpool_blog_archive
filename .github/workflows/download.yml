@@ -1,111 +1,67 @@
-
-name: Download Whirlpool Exblog Archive
+name: Crawl Whirlpool Staff Blog
 
 on:
   workflow_dispatch:
 
-permissions:
-  contents: write
+
 
 jobs:
-  download:
+  crawl:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write
+
     steps:
-      # ==========================================
-      # 1. 拉取仓库
-      # ==========================================
+
+      # ------------------------------------------------------
+      # Checkout
+      # ------------------------------------------------------
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ==========================================
-      # 2. 设置 Python
-      # ==========================================
+      # ------------------------------------------------------
+      # Python
+      # ------------------------------------------------------
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
 
-      # ==========================================
-      # 3. 安装依赖
-      # ==========================================
+      # ------------------------------------------------------
+      # Install dependencies
+      # ------------------------------------------------------
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 tqdm
+          pip install requests beautifulsoup4
 
-      # ==========================================
-      # 4. 运行爬虫
-      # ==========================================
+      # ------------------------------------------------------
+      # Run crawler
+      # ------------------------------------------------------
+
       - name: Run crawler
         run: |
           python crawler.py
 
-      # ==========================================
-      # 5. 查看生成结果
-      # ==========================================
-      - name: Show output
-        run: |
-          echo "======================================"
-          echo "Generated files"
-          echo "======================================"
+      # ------------------------------------------------------
+      # Commit results
+      # ------------------------------------------------------
 
-          echo ""
-          echo "Root:"
-          ls -lh
-
-          echo ""
-          echo "Images:"
-          if [ -d "images" ]; then
-            find images -type f | head -30
-            echo ""
-            echo "Image count:"
-            find images -type f | wc -l
-          else
-            echo "No images directory"
-          fi
-
-          echo ""
-          echo "Article URLs:"
-          if [ -f "article_urls.json" ]; then
-            python - <<'PY'
-          import json
-
-          with open("article_urls.json", "r", encoding="utf-8") as f:
-              data = json.load(f)
-
-          print("Article URL count:", len(data))
-          PY
-          fi
-
-          echo ""
-          echo "Articles:"
-          if [ -f "articles.json" ]; then
-            python - <<'PY'
-          import json
-
-          with open("articles.json", "r", encoding="utf-8") as f:
-              data = json.load(f)
-
-          print("Article count:", len(data))
-          PY
-          fi
-
-      # ==========================================
-      # 6. 提交结果回 GitHub
-      # ==========================================
-      - name: Commit results
+      - name: Commit crawled data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add articles.json
-          git add article_urls.json
-          git add images/
+          git add articles.json images/
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "Update Whirlpool blog archive"
+            git commit -m "Update Whirlpool Staff Blog archive"
             git push
           fi
