@@ -1,649 +1,679 @@
+from __future__ import annotations
+
 import json
-import os
+import logging
+import mimetypes
 import re
 import time
-from collections import deque
+from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from tqdm import tqdm
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 # ============================================================
-# Whirlpool Exblog 一次性全量爬虫
+# 配置
 # ============================================================
 
-BASE_URL = "http://wpblog.exblog.jp/"
-DOMAIN = "wpblog.exblog.jp"
+BASE_URL = "https://whirlpool.co.jp"
+BLOG_URL = f"{BASE_URL}/release/blog/"
 
-JSON_FILE = "articles.json"
-URL_FILE = "article_urls.json"
-IMAGE_DIR = "images"
+# 最终 JSON
+OUTPUT_FILE = Path("articles.json")
 
+# 图片保存目录
+IMAGE_DIR = Path("images")
+
+# 请求间隔，避免请求过快
+REQUEST_DELAY = 0.5
+
+# 请求超时时间
 REQUEST_TIMEOUT = 30
-PAGE_DELAY = 0.5
-IMAGE_DELAY = 0.3
 
-DOWNLOAD_IMAGES = True
+# 最大分页数
+# 当前网站数量不多，设置大一些即可。
+MAX_PAGES = 100
 
-
-# ============================================================
-# HTTP Header
-# ============================================================
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 "
-        "(Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 "
-        "(KHTML, like Gecko) "
-        "Chrome/151.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,"
-        "application/xml;q=0.9,image/avif,"
-        "image/webp,*/*;q=0.8"
-    ),
-    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-    "Connection": "keep-alive",
-}
-
-
-session = requests.Session()
-session.headers.update(HEADERS)
+# User-Agent
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/151.0.0.0 Safari/537.36"
+)
 
 
 # ============================================================
-# URL标准化
+# 日志
 # ============================================================
 
-def normalize_url(url):
-    """
-    将URL标准化为：
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
 
-    http://wpblog.exblog.jp/12345678/
+logger = logging.getLogger("whirlpool-crawler")
 
-    Exblog博客页面统一优先使用HTTP。
-    """
 
-    if not url:
-        return None
+# ============================================================
+# HTTP Session
+# ============================================================
 
-    url = url.strip()
+def create_session() -> requests.Session:
+    session = requests.Session()
 
-    # 相对URL
-    url = urljoin(BASE_URL, url)
-
-    parsed = urlparse(url)
-
-    if parsed.netloc.lower() != DOMAIN:
-        return None
-
-    if parsed.scheme not in ("http", "https"):
-        return None
-
-    # 只保留path
-    path = parsed.path
-
-    if not path:
-        return BASE_URL
-
-    # 文章URL
-    if re.fullmatch(r"/\d+/?", path):
-
-        return (
-            "http://"
-            + DOMAIN
-            + path.rstrip("/")
-            + "/"
-        )
-
-    # 普通列表/归档页面
-    return (
-        "http://"
-        + DOMAIN
-        + path
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        backoff_factor=1,
+        status_forcelist=[
+            429,
+            500,
+            502,
+            503,
+            504,
+        ],
+        allowed_methods=[
+            "GET",
+        ],
+        raise_on_status=False,
     )
 
-
-# ============================================================
-# 判断文章URL
-# ============================================================
-
-def is_article_url(url):
-
-    if not url:
-        return False
-
-    parsed = urlparse(url)
-
-    if parsed.netloc.lower() != DOMAIN:
-        return False
-
-    return bool(
-        re.fullmatch(
-            r"/\d+/?",
-            parsed.path
-        )
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=10,
+        pool_maxsize=10,
     )
 
+    session.mount(
+        "http://",
+        adapter,
+    )
+
+    session.mount(
+        "https://",
+        adapter,
+    )
+
+    session.headers.update(
+        {
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "ja,en;q=0.8",
+        }
+    )
+
+    return session
+
+
+session = create_session()
+
 
 # ============================================================
-# 请求页面
+# 基础工具
 # ============================================================
 
-def fetch(url):
+def sleep_between_requests() -> None:
+    time.sleep(REQUEST_DELAY)
+
+
+def get(url: str) -> requests.Response:
     """
-    优先HTTP。
-
-    如果HTTP失败，再尝试HTTPS。
+    统一 GET 请求。
     """
 
-    urls_to_try = []
-
-    parsed = urlparse(url)
-
-    http_url = (
-        "http://"
-        + parsed.netloc
-        + parsed.path
+    logger.debug(
+        "GET %s",
+        url,
     )
 
-    if parsed.query:
-        http_url += "?" + parsed.query
-
-    https_url = (
-        "https://"
-        + parsed.netloc
-        + parsed.path
+    response = session.get(
+        url,
+        timeout=REQUEST_TIMEOUT,
     )
 
-    if parsed.query:
-        https_url += "?" + parsed.query
+    response.raise_for_status()
 
-    # HTTP优先
-    urls_to_try.append(http_url)
+    sleep_between_requests()
 
-    # HTTPS作为备用
-    if https_url != http_url:
-        urls_to_try.append(https_url)
+    return response
 
 
-    last_error = None
+def get_soup(url: str) -> BeautifulSoup:
+    response = get(url)
 
-
-    for target_url in urls_to_try:
-
-        try:
-
-            response = session.get(
-                target_url,
-                timeout=REQUEST_TIMEOUT,
-                allow_redirects=True
-            )
-
-            response.raise_for_status()
-
-            # Exblog日文页面
-            response.encoding = (
-                response.apparent_encoding
-                or "utf-8"
-            )
-
-            return response.text
-
-
-        except Exception as e:
-
-            last_error = e
-
-            print(
-                f"访问失败，尝试下一个地址:\n"
-                f"{target_url}\n"
-                f"{e}"
-            )
-
-
-    print(
-        f"\n页面最终访问失败:\n"
-        f"{url}\n"
-        f"错误: {last_error}\n"
-    )
-
-    return None
-
-
-# ============================================================
-# 发现文章URL
-# ============================================================
-
-def discover_article_urls(html):
-
-    soup = BeautifulSoup(
-        html,
-        "html.parser"
-    )
-
-    urls = set()
-
-
-    # --------------------------------------------------------
-    # 1. 所有 <a href>
-    # --------------------------------------------------------
-
-    for a in soup.find_all("a"):
-
-        href = a.get("href")
-
-        if not href:
-            continue
-
-        full_url = normalize_url(
-            href
-        )
-
-        if (
-            full_url
-            and
-            is_article_url(full_url)
-        ):
-
-            urls.add(full_url)
-
-
-    # --------------------------------------------------------
-    # 2. RDF
-    #
-    # rdf:about
-    # dc:identifier
-    # --------------------------------------------------------
-
-    for tag in soup.find_all():
-
-        for attr_name in (
-            "rdf:about",
-            "about",
-            "dc:identifier"
-        ):
-
-            value = tag.get(
-                attr_name
-            )
-
-            if not value:
-                continue
-
-            full_url = normalize_url(
-                value
-            )
-
-            if (
-                full_url
-                and
-                is_article_url(full_url)
-            ):
-
-                urls.add(full_url)
-
-
-    # --------------------------------------------------------
-    # 3. 从原始HTML源码直接提取
-    #
-    # 防止RDF/XML被BeautifulSoup解析失败。
-    # --------------------------------------------------------
-
-    matches = re.findall(
-        r'https?://wpblog\.exblog\.jp/\d+/?',
-        html
-    )
-
-    for match in matches:
-
-        full_url = normalize_url(
-            match
-        )
-
-        if (
-            full_url
-            and
-            is_article_url(full_url)
-        ):
-
-            urls.add(full_url)
-
-
-    # --------------------------------------------------------
-    # 4. 相对文章URL
-    # --------------------------------------------------------
-
-    matches = re.findall(
-        r'(?<![\w-])/\d{7,9}/?',
-        html
-    )
-
-    for match in matches:
-
-        full_url = normalize_url(
-            match
-        )
-
-        if (
-            full_url
-            and
-            is_article_url(full_url)
-        ):
-
-            urls.add(full_url)
-
-
-    return urls
-
-
-# ============================================================
-# 发现历史页面 / 分页
-# ============================================================
-
-def discover_navigation_urls(html):
-
-    soup = BeautifulSoup(
-        html,
-        "html.parser"
-    )
-
-    urls = set()
-
-
-    navigation_keywords = [
-        "次のページ",
-        "前のページ",
-        "次へ",
-        "前へ",
-        "Older",
-        "Next",
-        "Previous",
-        "過去の記事",
-        "過去ログ",
-        "以前の記事",
-        "新しい記事",
-        "古い記事",
-        "NEXT",
-        "BACK",
-    ]
-
-
-    for a in soup.find_all("a"):
-
-        href = a.get("href")
-
-        if not href:
-            continue
-
-        full_url = urljoin(
-            BASE_URL,
-            href
-        )
-
-        parsed = urlparse(
-            full_url
-        )
-
-        if (
-            parsed.netloc.lower()
-            != DOMAIN
-        ):
-            continue
-
-        if is_article_url(
-            full_url
-        ):
-            continue
-
-        text = a.get_text(
-            " ",
-            strip=True
-        )
-
-        if any(
-            keyword in text
-            for keyword in navigation_keywords
-        ):
-
-            normalized = normalize_url(
-                full_url
-            )
-
-            if normalized:
-
-                urls.add(
-                    normalized
-                )
-
-
-    return urls
-
-
-# ============================================================
-# 日期
-# ============================================================
-
-def normalize_date(date_text):
-
-    if not date_text:
-        return ""
-
-    date_text = " ".join(
-        date_text.split()
-    )
-
-    match = re.search(
-        r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日",
-        date_text
-    )
-
-    if match:
-
-        year = match.group(1)
-        month = match.group(2).zfill(2)
-        day = match.group(3).zfill(2)
-
-        return (
-            f"{year}年"
-            f"{month}月"
-            f"{day}日"
-        )
-
-    return date_text
-
-
-# ============================================================
-# 日期 → YYYYMMDD
-# ============================================================
-
-def date_to_filename(date_text):
-
-    match = re.search(
-        r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日",
-        date_text
-    )
-
-    if not match:
-
-        return "unknown"
-
-
-    return (
-        match.group(1)
-        +
-        match.group(2).zfill(2)
-        +
-        match.group(3).zfill(2)
+    return BeautifulSoup(
+        response.content,
+        "lxml",
     )
 
 
-# ============================================================
-# 正文提取
-# ============================================================
+def clean_text(text: str) -> str:
+    """
+    清理正文文本。
 
-def extract_content(body):
+    重点：
+    - 保留换行
+    - 删除行首行尾多余空白
+    - 压缩连续空行
+    """
 
-    if not body:
-
-        return ""
-
-
-    # 复制正文
-    body_copy = BeautifulSoup(
-        str(body),
-        "html.parser"
-    )
-
-
-    # --------------------------------------------------------
-    # 删除结构性 <br class="clear">
-    # --------------------------------------------------------
-
-    for br in body_copy.select(
-        "br.clear"
-    ):
-
-        br.decompose()
-
-
-    # --------------------------------------------------------
-    # 删除图片
-    # --------------------------------------------------------
-
-    for img in body_copy.find_all(
-        "img"
-    ):
-
-        img.decompose()
-
-
-    # --------------------------------------------------------
-    # 删除只剩空内容的<a>
-    # --------------------------------------------------------
-
-    for a in body_copy.find_all(
-        "a"
-    ):
-
-        if not a.get_text(
-            " ",
-            strip=True
-        ):
-
-            a.decompose()
-
-
-    # --------------------------------------------------------
-    # 提取文本
-    # --------------------------------------------------------
-
-    content = body_copy.get_text(
+    text = text.replace(
+        "\r\n",
         "\n",
-        strip=True
     )
 
-
-    # --------------------------------------------------------
-    # 清理连续空行
-    # --------------------------------------------------------
+    text = text.replace(
+        "\r",
+        "\n",
+    )
 
     lines = []
 
-    for line in content.splitlines():
-
+    for line in text.split("\n"):
         line = line.strip()
 
         if line:
+            lines.append(line)
+        else:
+            # 暂时保留空行
+            lines.append("")
 
-            lines.append(
-                line
+    text = "\n".join(lines)
+
+    # 最多连续两个空行
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text,
+    )
+
+    return text.strip()
+
+
+def safe_filename(name: str) -> str:
+    """
+    将文件名处理成 Windows/Linux 都能使用的形式。
+    """
+
+    name = re.sub(
+        r'[<>:"/\\|?*\x00-\x1f]',
+        "_",
+        name,
+    )
+
+    name = name.strip(
+        " ."
+    )
+
+    if not name:
+        name = "unknown"
+
+    return name
+
+
+# ============================================================
+# 分页
+# ============================================================
+
+def get_page_url(page: int) -> str:
+    """
+    Whirlpool Blog 分页：
+
+    第 1 页：
+    /release/blog/
+
+    第 2 页：
+    /release/blog/page/2/
+
+    ...
+    """
+
+    if page == 1:
+        return BLOG_URL
+
+    return f"{BLOG_URL}page/{page}/"
+
+
+def is_valid_blog_page(
+    soup: BeautifulSoup,
+) -> bool:
+    """
+    判断页面是不是 Staff Blog 页面。
+    """
+
+    # 页面上应该存在：
+    # スタッフ日誌
+
+    text = soup.get_text(
+        " ",
+        strip=True,
+    )
+
+    return "スタッフ日誌" in text
+
+
+def discover_pages() -> list[str]:
+    """
+    自动发现所有 Blog 分页。
+
+    不直接假设只有 9 页。
+    """
+
+    pages = []
+
+    failed_pages = 0
+
+    for page_number in range(
+        1,
+        MAX_PAGES + 1,
+    ):
+
+        url = get_page_url(
+            page_number
+        )
+
+        try:
+            logger.info(
+                "检查目录页：第 %d 页",
+                page_number,
             )
 
+            soup = get_soup(url)
 
-    return "\n".join(
-        lines
+            if not is_valid_blog_page(
+                soup
+            ):
+                failed_pages += 1
+
+                logger.warning(
+                    "不是有效 Blog 页面：%s",
+                    url,
+                )
+
+                # 连续两页失败就认为分页结束
+                if failed_pages >= 2:
+                    break
+
+                continue
+
+            pages.append(url)
+
+            failed_pages = 0
+
+        except Exception as exc:
+
+            failed_pages += 1
+
+            logger.warning(
+                "目录页请求失败：%s | %s",
+                url,
+                exc,
+            )
+
+            if failed_pages >= 2:
+                break
+
+    logger.info(
+        "共发现 %d 个 Blog 目录页",
+        len(pages),
+    )
+
+    return pages
+
+
+# ============================================================
+# 文章 URL
+# ============================================================
+
+def is_article_url(
+    url: str,
+) -> bool:
+    """
+    判断是否为 Whirlpool Blog 单篇文章。
+
+    例如：
+
+    /release/blog/blog20260807/
+
+    /release/blog/blog20170224/
+    """
+
+    parsed = urlparse(url)
+
+    # 只允许 whirlpool.co.jp
+    if parsed.netloc:
+        if parsed.netloc.lower() != "whirlpool.co.jp":
+            return False
+
+    path = parsed.path.rstrip("/")
+
+    return bool(
+        re.match(
+            r"^/release/blog/blog\d{8}$",
+            path,
+        )
+    )
+
+
+def normalize_url(
+    url: str,
+) -> str:
+    """
+    统一 URL：
+
+    - 去掉 query
+    - 去掉 fragment
+    - 统一尾部 /
+    """
+
+    parsed = urlparse(url)
+
+    path = parsed.path.rstrip("/") + "/"
+
+    return (
+        f"{parsed.scheme}://"
+        f"{parsed.netloc}"
+        f"{path}"
+    )
+
+
+def discover_article_urls(
+    page_url: str,
+) -> list[str]:
+
+    soup = get_soup(
+        page_url
+    )
+
+    urls = []
+
+    for a in soup.find_all(
+        "a",
+        href=True,
+    ):
+
+        href = a.get("href")
+
+        if not href:
+            continue
+
+        url = urljoin(
+            page_url,
+            href,
+        )
+
+        url = normalize_url(
+            url
+        )
+
+        if is_article_url(url):
+            urls.append(url)
+
+    # 去重，同时保持顺序
+    return list(
+        dict.fromkeys(urls)
+    )
+
+
+def discover_all_article_urls() -> list[str]:
+    """
+    扫描所有目录页。
+    """
+
+    pages = discover_pages()
+
+    all_urls = []
+
+    for index, page_url in enumerate(
+        pages,
+        start=1,
+    ):
+
+        logger.info(
+            "[目录 %d/%d] %s",
+            index,
+            len(pages),
+            page_url,
+        )
+
+        try:
+
+            urls = discover_article_urls(
+                page_url
+            )
+
+            logger.info(
+                "发现 %d 篇文章",
+                len(urls),
+            )
+
+            all_urls.extend(
+                urls
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "目录扫描失败：%s",
+                page_url,
+            )
+
+    # 全局去重
+    all_urls = list(
+        dict.fromkeys(
+            all_urls
+        )
+    )
+
+    logger.info(
+        "总计发现 %d 篇文章",
+        len(all_urls),
+    )
+
+    return all_urls
+
+
+# ============================================================
+# 文章 ID
+# ============================================================
+
+def get_article_id(
+    url: str,
+) -> str:
+
+    match = re.search(
+        r"/(blog\d{8})/?$",
+        url,
+    )
+
+    if match:
+        return match.group(1)
+
+    return safe_filename(
+        url.rstrip("/").split("/")[-1]
     )
 
 
 # ============================================================
-# 图片URL
+# 文章解析
 # ============================================================
 
-def extract_image_urls(body):
+def extract_title(
+    soup: BeautifulSoup,
+) -> str:
+    """
+    标题：
 
-    if not body:
+    <article class="common-container">
+        <h4>...</h4>
+    """
 
-        return []
+    article = soup.select_one(
+        "article.common-container"
+    )
 
+    if article:
+
+        h4 = article.find(
+            "h4"
+        )
+
+        if h4:
+            return clean_text(
+                h4.get_text(
+                    "\n",
+                    strip=True,
+                )
+            )
+
+    # fallback
+    h4 = soup.find("h4")
+
+    if h4:
+        return clean_text(
+            h4.get_text(
+                "\n",
+                strip=True,
+            )
+        )
+
+    return ""
+
+
+def extract_date(
+    soup: BeautifulSoup,
+) -> str:
+    """
+    时间：
+
+    <p class="days en">
+        2026.08.07 UpDate
+    </p>
+
+    输出：
+
+    2026年08月07日
+    """
+
+    node = soup.select_one(
+        "p.days.en"
+    )
+
+    if not node:
+        return ""
+
+    text = clean_text(
+        node.get_text(
+            " ",
+            strip=True,
+        )
+    )
+
+    match = re.search(
+        r"(20\d{2})\.(\d{1,2})\.(\d{1,2})",
+        text,
+    )
+
+    if not match:
+        return text
+
+    year, month, day = match.groups()
+
+    return (
+        f"{year}年"
+        f"{int(month):02d}月"
+        f"{int(day):02d}日"
+    )
+
+
+def extract_content(
+    soup: BeautifulSoup,
+) -> str:
+    """
+    正文：
+
+    <div class="main-text">
+        ...
+    </div>
+    """
+
+    node = soup.select_one(
+        "div.main-text"
+    )
+
+    if not node:
+        return ""
+
+    # 使用 get_text("\n")：
+    # HTML 中的 <br>、段落、块元素会尽量转换成换行。
+    text = node.get_text(
+        "\n",
+        strip=False,
+    )
+
+    return clean_text(
+        text
+    )
+
+
+# ============================================================
+# 图片
+# ============================================================
+
+def extract_image_urls(
+    soup: BeautifulSoup,
+    article_url: str,
+) -> list[str]:
+    """
+    图片结构：
+
+    <div class="image-box">
+        <img src="...">
+    </div>
+
+    返回图片 URL。
+    """
 
     image_urls = []
 
-
-    for img in body.find_all(
-        "img"
+    for box in soup.select(
+        "div.image-box"
     ):
 
-        src = (
-            img.get("src")
-            or
-            img.get("data-src")
-            or
-            img.get("data-original")
-        )
+        for img in box.find_all(
+            "img"
+        ):
 
-
-        # ----------------------------------------------------
-        # 优先取图片外层<a>的href
-        # ----------------------------------------------------
-
-        parent_a = img.find_parent(
-            "a"
-        )
-
-
-        if parent_a:
-
-            href = parent_a.get(
-                "href"
+            src = img.get(
+                "src"
             )
 
-            if href:
-
-                image_url = urljoin(
-                    BASE_URL,
-                    href
-                )
-
-                if image_url not in image_urls:
-
-                    image_urls.append(
-                        image_url
-                    )
-
+            if not src:
                 continue
 
-
-        # ----------------------------------------------------
-        # 没有<a>则使用img src
-        # ----------------------------------------------------
-
-        if src:
-
             image_url = urljoin(
-                BASE_URL,
-                src
+                article_url,
+                src,
+            )
+
+            # 去掉 query / fragment
+            parsed = urlparse(
+                image_url
+            )
+
+            image_url = (
+                f"{parsed.scheme}://"
+                f"{parsed.netloc}"
+                f"{parsed.path}"
             )
 
             if image_url not in image_urls:
-
                 image_urls.append(
                     image_url
                 )
-
 
     return image_urls
 
@@ -652,476 +682,315 @@ def extract_image_urls(body):
 # 图片下载
 # ============================================================
 
-def download_image(
-    image_url,
-    filename
-):
+def get_image_extension(
+    image_url: str,
+    response: requests.Response,
+) -> str:
 
-    parsed = urlparse(
+    # 首选 URL 后缀
+    path = urlparse(
         image_url
+    ).path
+
+    suffix = Path(
+        path
+    ).suffix.lower()
+
+    valid_extensions = {
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gif",
+        ".webp",
+        ".bmp",
+        ".svg",
+        ".avif",
+    }
+
+    if suffix in valid_extensions:
+        return suffix
+
+    # fallback：Content-Type
+    content_type = (
+        response.headers
+        .get(
+            "Content-Type",
+            "",
+        )
+        .split(";")[0]
+        .strip()
+        .lower()
     )
 
+    extension = mimetypes.guess_extension(
+        content_type
+    )
 
-    urls_to_try = [
-        image_url
+    if extension:
+        return extension
+
+    return ".bin"
+
+
+def download_images(
+    image_urls: list[str],
+    article_id: str,
+) -> list[str]:
+    """
+    下载文章图片。
+
+    保存：
+
+    images/
+        blog20260807/
+            001.png
+            002.jpg
+
+    返回：
+
+    [
+        "images/blog20260807/001.png",
+        "images/blog20260807/002.jpg"
     ]
+    """
 
+    if not image_urls:
+        return []
 
-    # HTTPS失败后尝试HTTP
-    if parsed.scheme == "https":
+    article_image_dir = (
+        IMAGE_DIR
+        / article_id
+    )
 
-        http_url = (
-            "http://"
-            + parsed.netloc
-            + parsed.path
-        )
+    article_image_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-        if parsed.query:
+    local_paths = []
 
-            http_url += (
-                "?"
-                +
-                parsed.query
-            )
-
-        urls_to_try.append(
-            http_url
-        )
-
-
-    last_error = None
-
-
-    for target_url in urls_to_try:
+    for index, image_url in enumerate(
+        image_urls,
+        start=1,
+    ):
 
         try:
 
-            response = session.get(
-                target_url,
-                timeout=REQUEST_TIMEOUT,
-                allow_redirects=True
+            logger.info(
+                "    下载图片 [%d/%d] %s",
+                index,
+                len(image_urls),
+                image_url,
             )
 
-            response.raise_for_status()
+            response = get(
+                image_url
+            )
 
+            content_type = (
+                response.headers
+                .get(
+                    "Content-Type",
+                    "",
+                )
+                .lower()
+            )
 
-            # ------------------------------------------------
-            # 判断图片扩展名
-            # ------------------------------------------------
-
-            final_path = urlparse(
-                response.url
-            ).path
-
-            ext = os.path.splitext(
-                final_path
-            )[1].lower()
-
-
-            if ext not in (
-                ".jpg",
-                ".jpeg",
-                ".png",
-                ".gif",
-                ".webp",
-                ".bmp"
+            # 防止错误页面被保存成图片
+            if (
+                content_type
+                and not content_type.startswith(
+                    "image/"
+                )
             ):
 
-                content_type = (
-                    response.headers
-                    .get(
-                        "Content-Type",
-                        ""
-                    )
-                    .lower()
+                logger.warning(
+                    "    跳过非图片资源：%s",
+                    content_type,
                 )
 
+                continue
 
-                if "png" in content_type:
-
-                    ext = ".png"
-
-                elif "gif" in content_type:
-
-                    ext = ".gif"
-
-                elif "webp" in content_type:
-
-                    ext = ".webp"
-
-                else:
-
-                    ext = ".jpg"
-
-
-            path = os.path.join(
-                IMAGE_DIR,
-                filename + ext
+            extension = get_image_extension(
+                image_url,
+                response,
             )
 
-
-            with open(
-                path,
-                "wb"
-            ) as f:
-
-                f.write(
-                    response.content
-                )
-
-
-            return os.path.basename(
-                path
+            filename = (
+                f"{index:03d}"
+                f"{extension}"
             )
 
+            file_path = (
+                article_image_dir
+                / filename
+            )
 
-        except Exception as e:
+            file_path.write_bytes(
+                response.content
+            )
 
-            last_error = e
+            # JSON 使用正斜杠
+            relative_path = (
+                file_path
+                .as_posix()
+            )
 
+            local_paths.append(
+                relative_path
+            )
 
-    print(
-        "\n图片下载失败:"
-    )
+        except Exception as exc:
 
-    print(
-        image_url
-    )
+            logger.warning(
+                "    图片下载失败：%s | %s",
+                image_url,
+                exc,
+            )
 
-    print(
-        last_error
-    )
-
-
-    return None
+    return local_paths
 
 
 # ============================================================
 # 单篇文章
 # ============================================================
 
-def crawl_article(url):
+def crawl_article(
+    url: str,
+) -> dict:
 
-    html = fetch(
+    logger.info(
+        "抓取文章：%s",
+        url,
+    )
+
+    soup = get_soup(
         url
     )
 
-
-    if not html:
-
-        return None
-
-
-    soup = BeautifulSoup(
-        html,
-        "html.parser"
+    article_id = get_article_id(
+        url
     )
 
-
-    # --------------------------------------------------------
-    # 标题
-    # --------------------------------------------------------
-
-    title_element = soup.select_one(
-        "h2.POST_TTL"
+    title = extract_title(
+        soup
     )
 
-
-    title = ""
-
-    if title_element:
-
-        title = title_element.get_text(
-            " ",
-            strip=True
-        )
-
-
-    # --------------------------------------------------------
-    # 日期
-    # --------------------------------------------------------
-
-    date_element = soup.select_one(
-        "div.POST_TOP"
+    date = extract_date(
+        soup
     )
 
-
-    date = ""
-
-    if date_element:
-
-        date = normalize_date(
-            date_element.get_text(
-                " ",
-                strip=True
-            )
-        )
-
-
-    # --------------------------------------------------------
-    # 正文
-    # --------------------------------------------------------
-
-    body = soup.select_one(
-        "div.POST_BODY_SUB"
+    content = extract_content(
+        soup
     )
 
+    image_urls = extract_image_urls(
+        soup,
+        url,
+    )
 
-    if not body:
+    logger.info(
+        "    标题：%s",
+        title,
+    )
 
-        print(
-            f"\n警告：正文不存在:"
-            f"\n{url}"
-        )
+    logger.info(
+        "    日期：%s",
+        date,
+    )
 
-        content = ""
+    logger.info(
+        "    正文：%d 字",
+        len(content),
+    )
 
-        image_urls = []
+    logger.info(
+        "    图片：%d 张",
+        len(image_urls),
+    )
 
-    else:
-
-        content = extract_content(
-            body
-        )
-
-        image_urls = extract_image_urls(
-            body
-        )
-
-
-    # --------------------------------------------------------
     # 下载图片
-    # --------------------------------------------------------
-
-    images = []
-
-
-    if DOWNLOAD_IMAGES:
-
-        date_key = date_to_filename(
-            date
-        )
-
-
-        for index, image_url in enumerate(
-            image_urls,
-            start=1
-        ):
-
-            filename = (
-                f"{date_key}-"
-                f"{index:02d}"
-            )
-
-
-            saved = download_image(
-                image_url,
-                filename
-            )
-
-
-            if saved:
-
-                images.append(
-                    {
-                        "file": saved,
-                        "url": image_url
-                    }
-                )
-
-
-            time.sleep(
-                IMAGE_DELAY
-            )
-
-
-    else:
-
-        images = [
-            {
-                "file": "",
-                "url": image_url
-            }
-            for image_url in image_urls
-        ]
-
+    images = download_images(
+        image_urls,
+        article_id,
+    )
 
     return {
         "url": url,
         "title": title,
         "date": date,
         "content": content,
-        "images": images
+        "images": images,
     }
 
 
 # ============================================================
-# 第一阶段：发现全部文章
+# JSON
 # ============================================================
 
-def discover_all_articles():
+def load_existing_articles() -> list[dict]:
+    """
+    如果已经存在 articles.json，
+    则读取之前已经成功抓取的数据。
+    """
 
-    print(
-        "=" * 60
-    )
+    if not OUTPUT_FILE.exists():
+        return []
 
-    print(
-        "第一阶段：发现文章"
-    )
+    try:
 
-    print(
-        "=" * 60
-    )
-
-
-    queue = deque()
-
-    queue.append(
-        BASE_URL
-    )
-
-
-    visited_pages = set()
-
-    article_urls = set()
-
-
-    while queue:
-
-        page_url = queue.popleft()
-
-
-        if page_url in visited_pages:
-
-            continue
-
-
-        visited_pages.add(
-            page_url
-        )
-
-
-        print(
-            f"\n扫描页面: {page_url}"
-        )
-
-
-        html = fetch(
-            page_url
-        )
-
-
-        if not html:
-
-            continue
-
-
-        # ----------------------------------------------------
-        # 发现文章
-        # ----------------------------------------------------
-
-        found_articles = (
-            discover_article_urls(
-                html
+        data = json.loads(
+            OUTPUT_FILE.read_text(
+                encoding="utf-8"
             )
         )
 
+        if isinstance(data, list):
+            return data
 
-        old_count = len(
-            article_urls
+        return []
+
+    except Exception as exc:
+
+        logger.warning(
+            "读取已有 JSON 失败：%s",
+            exc,
         )
 
+        return []
 
-        article_urls.update(
-            found_articles
+
+def save_articles(
+    articles: list[dict],
+) -> None:
+    """
+    保存 JSON。
+
+    按日期倒序。
+    """
+
+    def sort_key(
+        item: dict,
+    ) -> str:
+
+        return item.get(
+            "date",
+            "",
         )
 
-
-        new_count = (
-            len(article_urls)
-            -
-            old_count
-        )
-
-
-        print(
-            f"发现文章: {new_count} "
-            f"篇，累计: "
-            f"{len(article_urls)}"
-        )
-
-
-        # ----------------------------------------------------
-        # 发现分页
-        # ----------------------------------------------------
-
-        navigation_urls = (
-            discover_navigation_urls(
-                html
-            )
-        )
-
-
-        for nav_url in navigation_urls:
-
-            if nav_url not in visited_pages:
-
-                queue.append(
-                    nav_url
-                )
-
-
-        time.sleep(
-            PAGE_DELAY
-        )
-
-
-    print()
-
-    print(
-        "=" * 60
+    articles.sort(
+        key=sort_key,
+        reverse=True,
     )
 
-    print(
-        f"文章发现完成："
-        f"{len(article_urls)} 篇"
-    )
-
-    print(
-        f"扫描页面："
-        f"{len(visited_pages)} 个"
-    )
-
-    print(
-        "=" * 60
-    )
-
-
-    return sorted(
-        article_urls
-    )
-
-
-# ============================================================
-# 保存JSON
-# ============================================================
-
-def save_json(
-    articles
-):
-
-    with open(
-        JSON_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
+    OUTPUT_FILE.write_text(
+        json.dumps(
             articles,
-            f,
             ensure_ascii=False,
-            indent=2
-        )
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
 
 # ============================================================
@@ -1130,150 +999,195 @@ def save_json(
 
 def main():
 
-    os.makedirs(
-        IMAGE_DIR,
-        exist_ok=True
+    logger.info("=" * 70)
+    logger.info(
+        "Whirlpool Staff Blog Crawler"
+    )
+    logger.info("=" * 70)
+
+    IMAGE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-
-    # ========================================================
-    # 第一阶段
-    # ========================================================
+    # --------------------------------------------------------
+    # 1. 扫描所有文章 URL
+    # --------------------------------------------------------
 
     article_urls = (
-        discover_all_articles()
+        discover_all_article_urls()
     )
-
 
     if not article_urls:
 
-        print(
-            "\n没有发现任何文章。"
+        logger.error(
+            "没有发现任何文章。"
         )
 
         return
 
+    # --------------------------------------------------------
+    # 2. 读取已有数据
+    # --------------------------------------------------------
+
+    articles = (
+        load_existing_articles()
+    )
+
+    existing_urls = {
+        article.get("url")
+        for article in articles
+        if article.get("url")
+    }
+
+    logger.info(
+        "已有文章：%d 篇",
+        len(existing_urls),
+    )
 
     # --------------------------------------------------------
-    # 保存URL列表
+    # 3. 全量抓取
     # --------------------------------------------------------
 
-    with open(
-        URL_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
+    success = 0
+    skipped = 0
+    failed = 0
 
-        json.dump(
-            article_urls,
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
-
-
-    print(
-        f"\n文章URL已经保存到："
-        f"{URL_FILE}"
+    total = len(
+        article_urls
     )
-
-
-    # ========================================================
-    # 第二阶段
-    # ========================================================
-
-    print()
-
-    print(
-        "=" * 60
-    )
-
-    print(
-        "第二阶段：抓取文章"
-    )
-
-    print(
-        "=" * 60
-    )
-
-    print(
-        f"总文章数："
-        f"{len(article_urls)}"
-    )
-
-
-    articles = []
-
 
     for index, url in enumerate(
-        tqdm(
-            article_urls,
-            desc="抓取文章"
-        ),
-        start=1
+        article_urls,
+        start=1,
     ):
 
-        article = crawl_article(
-            url
+        logger.info(
+            ""
         )
 
+        logger.info(
+            "================================================"
+        )
 
-        if article:
+        logger.info(
+            "[%d/%d]",
+            index,
+            total,
+        )
+
+        # ----------------------------------------------------
+        # 已经抓过
+        # ----------------------------------------------------
+
+        if url in existing_urls:
+
+            logger.info(
+                "已存在，跳过：%s",
+                url,
+            )
+
+            skipped += 1
+
+            continue
+
+        # ----------------------------------------------------
+        # 抓取
+        # ----------------------------------------------------
+
+        try:
+
+            article = crawl_article(
+                url
+            )
+
+            # 防止重复
+            articles = [
+                item
+                for item in articles
+                if item.get("url") != url
+            ]
 
             articles.append(
                 article
             )
 
+            # 每完成一篇立即保存
+            # 防止程序中断造成大量进度丢失
+            save_articles(
+                articles
+            )
 
-        time.sleep(
-            PAGE_DELAY
-        )
+            success += 1
 
+            logger.info(
+                "抓取成功：%s",
+                article.get(
+                    "title",
+                    "",
+                ),
+            )
 
-    # ========================================================
-    # 保存
-    # ========================================================
+        except Exception as exc:
 
-    save_json(
+            failed += 1
+
+            logger.exception(
+                "抓取失败：%s",
+                url,
+            )
+
+    # --------------------------------------------------------
+    # 4. 最终保存
+    # --------------------------------------------------------
+
+    save_articles(
         articles
     )
 
+    # --------------------------------------------------------
+    # 5. Summary
+    # --------------------------------------------------------
 
-    print()
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info(
+        "全部任务完成"
+    )
+    logger.info("=" * 70)
 
-    print(
-        "=" * 60
+    logger.info(
+        "发现文章：%d",
+        total,
     )
 
-    print(
-        "全部完成"
+    logger.info(
+        "本次成功：%d",
+        success,
     )
 
-    print(
-        "=" * 60
+    logger.info(
+        "跳过已有：%d",
+        skipped,
     )
 
-    print(
-        f"成功保存文章："
-        f"{len(articles)} 篇"
+    logger.info(
+        "失败：%d",
+        failed,
     )
 
-    print(
-        f"JSON："
-        f"{JSON_FILE}"
+    logger.info(
+        "JSON：%s",
+        OUTPUT_FILE,
     )
 
-    print(
-        f"图片目录："
-        f"{IMAGE_DIR}/"
+    logger.info(
+        "图片：%s",
+        IMAGE_DIR,
     )
 
+    logger.info("=" * 70)
 
-# ============================================================
-# Entry Point
-# ============================================================
 
 if __name__ == "__main__":
-
     main()
-
